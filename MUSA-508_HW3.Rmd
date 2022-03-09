@@ -1,0 +1,858 @@
+---
+title: "MUSA-508 HW3: Predicting Risk"
+knit: (function(input_file, encoding) {
+  out_dir <- 'docs';
+  rmarkdown::render(input_file,
+ encoding=encoding,
+ output_file=file.path(dirname(input_file), out_dir, 'index.html'))})
+author: "Adrian Leon"
+date: "10/25/2021"
+output: 
+  html_document: 
+    toc: true
+    toc_float: true
+    code_folding: hide
+    
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = T, warning = F, error = F, message = F, results = F)
+
+# Load libraries
+library(tidyverse)
+library(tidycensus)
+library(sf)
+library(RSocrata)
+library(viridis)
+library(spatstat)
+library(raster)
+library(spdep)
+library(FNN)
+library(grid)
+library(gridExtra)
+library(knitr)
+library(kableExtra)
+library(mapview)
+
+# functions
+root.dir = "https://raw.githubusercontent.com/urbanSpatial/Public-Policy-Analytics-Landing/master/DATA/"
+source("https://raw.githubusercontent.com/urbanSpatial/Public-Policy-Analytics-Landing/master/functions.r")
+
+
+# function shorcuts
+g <- glimpse
+m <- mapview
+st_c <- st_coordinates
+st_coid <- st_centroid
+
+# redefine Cross validate
+crossValidate <- function(dataset, id, dependentVariable, indVariables, indVariableName) {
+  
+  allPredictions <- data.frame()
+  cvID_list <- unique(dataset[[id]])
+  
+  for (i in cvID_list) {
+    
+    thisFold <- i
+    cat("This hold out fold is", thisFold, "\n")
+    
+    fold.train <- filter(dataset, dataset[[id]] != thisFold) %>% as.data.frame() %>% 
+      dplyr::select(id, geometry, indVariables, dependentVariable)
+    fold.test  <- filter(dataset, dataset[[id]] == thisFold) %>% as.data.frame() %>% 
+      dplyr::select(id, geometry, indVariables, dependentVariable)
+    
+    regression <-
+      glm(countOccurrences ~ ., family = "poisson", 
+          data = fold.train %>% 
+            dplyr::select(-geometry, -id))
+    
+    thisPrediction <- 
+      mutate(fold.test, Prediction = predict(regression, fold.test, type = "response"))
+    
+    allPredictions <-
+      rbind(allPredictions, thisPrediction)
+    
+  }
+  return(st_sf(allPredictions))
+}
+
+
+# set map theme
+mapTheme <- 
+  function(base_size = 12, title_size = 16) {
+  theme(
+    text = element_text( color = "black"),
+    plot.title = element_text(size = title_size, colour = "black"),
+    plot.subtitle=element_text(face="italic", size = 10),
+    plot.caption=element_text(hjust=0),
+    legend.text=element_text(size=6),
+    axis.ticks = element_blank(),
+    panel.background = element_rect(fill = "#dfdfdf"),
+    axis.title = element_blank(),
+    axis.text = element_blank(),
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+    panel.grid = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_blank(),
+    strip.text.x = element_text(size = 14))
+  }
+
+# imperial to metric 
+feetM = 3.28084
+
+# census API key:
+census_api_key("e79f3706b6d61249968c6ce88794f6f556e5bf3d", overwrite = FALSE)
+
+```
+
+
+
+## Predicting family violence in Chicago, IL.
+
+
+
+### Introduction
+
+
+Family violence is one of the few clear examples of phenomenon that because of their nature, can be more effectively prevented by adaptive predictive policing tools than by the conventional policing strategies. This is due to three of its inherent characteristics:
+
+
+First, family violence is widespread. According to [a 2005 report]( https://bjs.ojp.gov/library/publications/family-violence-statistics-including-statistics-strangers-and-acquaintances) by the US Department of Justice Bureau of Justice Statistics, family violence amounted to 11% of all the reported and unreported violent incidents between 1998 and 2002. 
+
+
+Second, family violence often goes unnoticed even though it tends to be chronic, given that it almost exclusively happens in private spaces and within family structures that are difficult to intervene by others. Also, because these incidents usually go unreported and are usually engrained within family dynamics, they usually happen numerous times in the same household.
+
+
+Third, and most important, family violence is systematically unreported for a myriad of reasons, including financial dependency of the victim to the offender, psychological intimidation, public shame or religion. According to the same DoJ report, two out of five family violence incidents go unreported, with the most common reasons being that the incident was a "private/personal matter" (34% of the time) and to "protect the offender" (in 12% of occasions). Other important reason for not reporting family violence could be fear of retaliation, especially since of all incidents reported to police between 1998 and 2002, only 36% resulted in an arrest.
+
+
+In order to produce an algorithm that can predict risk of family violence, or rather its most commonly reported manifestation, **domestic battery**, we are going use the city of Chicago as the testing ground, taking relevant [open data from the city]( https://data.cityofchicago.org/) that could be translated into possible predictors of the latent risk of family violence, following the main axiom behind [Environmental Criminology]( https://www.ojp.gov/ncjrs/virtual-library/abstracts/environmental-criminology-and-crime-analysis) that crime “is patterned according to the criminogenic nature of the environment”.
+
+
+
+```{r boundary, census and crime data}
+
+# import police districts
+policeDistricts <- 
+  st_read("https://data.cityofchicago.org/api/geospatial/fthy-xz3r?method=export&format=GeoJSON") %>%
+  st_transform('ESRI:102271') %>%
+  dplyr::select(District = dist_num)
+
+# import sub-district policing units called 'Beats'
+policeBeats <- 
+  st_read("https://data.cityofchicago.org/api/geospatial/aerh-rz74?method=export&format=GeoJSON") %>%
+  st_transform('ESRI:102271') %>%
+  dplyr::select(District = beat_num)
+
+# Join both boundary units in one list
+bothPoliceUnits <- rbind(mutate(policeDistricts, Legend = "Police Districts"), 
+                         mutate(policeBeats, Legend = "Police Beats"))
+
+# import Chicago city boundary
+chicagoBoundary <- 
+  st_read(file.path(root.dir,"/Chapter5/chicagoBoundary.geojson")) %>%
+  st_transform('ESRI:102271') 
+
+# import neighborhood boundaries for LOOCV
+neighborhoods <- 
+  st_read("https://raw.githubusercontent.com/blackmad/neighborhoods/master/chicago.geojson") %>%
+  st_transform('ESRI:102271') %>%
+  filter(cartodb_id != 52) # Remove O'Hare airport neighborhood
+
+# point in the Loop to calculate distance to
+loopPoint <-
+  filter(neighborhoods, name == "Loop") %>%
+  st_centroid()
+
+
+tracts18 <- 
+  get_acs(geography = "tract",
+          variables = c("B01001_001E","B01001A_001E"), 
+          year = 2018,
+          state=17,
+          county=031,
+          geometry=T) %>%
+  st_transform('ESRI:102271')  %>% 
+  dplyr::select(variable, estimate, GEOID) %>%
+  spread(variable, estimate) %>%
+  rename(TotalPop = B01001_001,
+         NumberWhites = B01001A_001) %>%
+  mutate(percentWhite = NumberWhites / TotalPop,
+         raceContext = ifelse(percentWhite > .5, "MajorityWhite", "MajorityNonWhite")) %>%
+  .[neighborhoods,]
+
+
+# import offenses to explore which could have more selection bias than burglaries
+crimes <- read.socrata("https://data.cityofchicago.org/Public-Safety/Crimes-2017/d62x-nvdr")
+
+crimeTypes <- crimes %>%
+  dplyr::select(Primary.Type, Description)
+crimeCategories <- unique(crimeTypes$Primary.Type)
+crimeCatalog <- list()
+
+for (crime in crimeCategories){
+  crimeType <- crimeTypes %>% filter(Primary.Type == crime)
+  crimeCatalog[[crime]] <- unique(crimeType$Description)
+}
+
+# domestic battery
+battery <- do.call(cbind.data.frame, crimeCatalog['BATTERY'])
+
+domesticBattery <- battery %>% filter(., grepl("DOMESTIC", BATTERY))
+
+# plug-in the crime
+crimeSubtype <- domesticBattery
+crimeType <- names(crimeSubtype)
+
+# clean and reproject
+occurrences <- 
+  crimes %>% 
+    filter(Primary.Type == crimeType & 
+             Description %in% unlist(apply(crimeSubtype, 1, list), recursive = FALSE)) %>%  
+    mutate(x = gsub("[()]", "", Location)) %>%
+    separate(x,into= c("Y","X"), sep=",") %>%
+    mutate(X = as.numeric(X),Y = as.numeric(Y)) %>% 
+    na.omit() %>%
+    st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant")%>%
+    st_transform('ESRI:102271') %>% 
+    distinct()
+
+# set up the fishnet bins to classify the points
+fishnet <- 
+  st_make_grid(chicagoBoundary,
+               cellsize = 500, 
+               square = TRUE) %>%
+  .[chicagoBoundary] %>%             # clip to chicago boundary
+  st_sf() %>%
+  mutate(uniqueID = rownames(.))
+
+
+# add a value of 1 to each occurence and join them to the fishnet
+occurrenceNet <- 
+  dplyr::select(occurrences) %>% 
+  mutate(countOccurrences = 1) %>% 
+  aggregate(., fishnet, sum) %>%                       # used as a spatial join that sums
+  mutate(countOccurrences = replace_na(countOccurrences, 0),
+         uniqueID = rownames(.),
+         cvID = sample(round(nrow(fishnet) / 24),      # random cross validation ID (out of 100) for later use
+                       size=nrow(fishnet), replace = TRUE))  
+
+```
+
+
+
+***
+
+
+### The spatial distribution of Domestic battery and its bias
+
+When looking at the spatial distribution of a police-reported event, such as domestic battery in Chicago, it is necessary to understand the possible selection bias that could be ingrained into the reported data and how it could manifest in space. 
+
+```{r map of incidences}
+
+# plot two side-by-side maps of incidents and their density in the fishnet
+grid.arrange(ncol=2,
+ggplot() +
+  geom_sf(data = neighborhoods, colour = "#888888", fill= "#96ecff") +
+  geom_sf(data = chicagoBoundary, colour = "#686868", fill = NA, size = 0.6) +
+  geom_sf(data = sample_n(occurrences, 1500), size = .5, colour = "#ff3300", alpha = 0.5) +
+  scale_fill_viridis(discrete = TRUE) +
+  labs(title="Domestic Battery in Chicago, 2007",
+       subtitle="Incidents",
+       caption = "Source: Chicago Data Portal") +
+  mapTheme(title_size = 14) +
+  theme(plot.margin=unit(c(1,-1,1,1), "cm")),
+ggplot() +
+  geom_sf(data = neighborhoods, colour = "#aaaaaa", fill=NA) +
+  geom_sf(data = occurrenceNet, aes(fill = countOccurrences), color = NA) +
+  scale_fill_viridis(option = "inferno") +
+  labs(title="",
+       subtitle="Density of incidents",
+       caption = "") +
+  mapTheme(title_size = 12)+
+  theme(plot.margin=unit(c(1,1,1,-1), "cm"),
+           legend.position = "right",
+           legend.title=element_blank())
+)
+```
+
+One of the main characteristics of domestic violence is that the disproportionate majority of victims are female (73%) and the majority of offenders are male (75%). However, when looking at how reported incidents divide across race, the information seems mixed. For example, the aforementioned report claims that most family violence victims were white (74%) as well as most offenders (79%), which may hint at possible **under-reporting** in non-white communities.
+
+
+On the other hand, a more recent [report by the City of New York](https://www.nyc.gov/assets/ocdv/downloads/pdf/ENDGBV-Intersection-DV-Race-ethnicity-Sex.pdf) found out that black New Yorkers are disproportionally affected by family violence, accounting for **46.4%** of domestic violence related felony assault victims while only representing **21.9%** of the city’s population. By doing a quick comparison between the [spatial distribution of race in Chicago]( http://www.radicalcartography.net/index.html?chicagodots) and the density of domestic battery incidents, and given this city’s evident segregation, it can be suggested that Chicago follows a similar pattern as that of New York City.
+
+
+However, there could be two other potential explanations as to why domestic battery is more reported in black majority neighborhoods. First, these communities have been historically over policed, [especially in Chicago]( https://www.chicagoreview.org/simon-balto-occupied-territory-policing-black-chicago-from-red-summer-to-black-power/) and consequently these incidents are more easily “detected” when they occur. Second, these communities tend to live in [poorer and denser communities](https://voorheescenter.uic.edu/who-can-live-in-chicago/) and because of how families traditionally interact between each other and share community resources and spaces, these incidents may become more noticeable to people outside the family.
+
+
+***
+
+
+### Predictive features
+
+From Chicago’s open data repository, four types of reported incidents were selected as possible indicators of external “risk” conditions that may induce or be related to domestic battery: building code violations, 311 sanitation code complaints, 311 requests for rodent baiting and the distribution of Liquor Retail licenses.
+
+
+Furthermore, these features were additionally re-engineered as the average distance to these incidents, which can be interpreted as the spatial exposure to them.
+
+
+```{r spatial features}
+
+sanitationCode <- 
+  read.socrata("https://data.cityofchicago.org/Service-Requests/311-Service-Requests-Sanitation-Code-Complaints-Hi/me59-5fac") %>% 
+  mutate(year = substr(creation_date, 1, 4)) %>%
+  filter(year == "2017") %>%
+  dplyr::select(Y= latitude, X=longitude) %>%
+  na.omit() %>%
+  st_as_sf(coords = c('X', 'Y'), crs = 4326, agr = 'constant') %>%
+  st_transform(st_crs(fishnet)) %>%
+  mutate(Legend = "sanitation")
+
+
+rodentBait <- 
+  read.socrata("https://data.cityofchicago.org/Service-Requests/311-Service-Requests-Rodent-Baiting-No-Duplicates/uqhs-j723") %>%
+  mutate(year = substr(Creation.Date,1,4)) %>%
+  filter(year == "2017",
+         Most.Recent.Action == "Inspected and baited",
+         Number.of.Premises.with.Rats > 0,
+         Number.of.Premises.with.Garbage > 0) %>%
+  dplyr::select(Y = Latitude, X = Longitude) %>%
+  na.omit() %>%
+  st_as_sf(coords = c('X', 'Y'), crs = 4326, agr = 'constant') %>%
+  st_transform(st_crs(fishnet)) %>%
+  mutate(Legend = "rodents")
+
+
+buildingCode <- 
+  read.socrata("https://data.cityofchicago.org/Buildings/Building-Violations/22u3-xenr") %>%
+  mutate(year = substr(violation_date, 1, 4)) %>%
+  filter(year == "2017") %>%
+  filter(inspection_status == "FAILED")%>%
+  dplyr::select(Y = latitude, X = longitude) %>%
+  na.omit() %>%
+  st_as_sf(coords = c('X','Y'), crs = 4326, agr = 'constant') %>%
+  st_transform(st_crs(fishnet)) %>%
+  mutate(Legend = "buildingViolations")
+
+
+liquorLicenses <- 
+  read.socrata('https://data.cityofchicago.org/api/views/nrmj-3kcf/rows.json') %>%
+  dplyr::select(Y = LATITUDE, X = LONGITUDE) %>%
+  na.omit() %>%
+  st_as_sf(coords = c('X','Y'), crs = 4326, agr = 'constant') %>%
+  st_transform(st_crs(fishnet)) %>%
+  mutate(Legend = 'liquorSell')
+
+
+```
+
+
+```{r join independent variables to NN}
+
+# Ordinance violations
+varsNet <- 
+  rbind(buildingCode,
+        liquorLicenses,
+        rodentBait,
+        sanitationCode) %>%
+  st_join(., fishnet, join=st_within) %>%
+  st_drop_geometry() %>%
+  group_by(uniqueID, Legend) %>%
+  summarize(count = n()) %>%
+  full_join(fishnet) %>%
+  spread(Legend, count, fill=0) %>%
+  st_sf() %>%
+  dplyr::select(-`<NA>`) %>%
+  na.omit() %>%
+  ungroup() %>%
+  mutate(buildingViolations_NN =
+           nn_function(st_c(st_coid(.)), st_c(buildingCode),3)) %>%
+  mutate(liquorSell_NN = 
+           nn_function(st_c(st_coid(.)), st_c(liquorLicenses),3)) %>% 
+  mutate(rodents_NN =
+           nn_function(st_c(st_coid(.)), st_c(rodentBait),3)) %>%
+  mutate(sanitation_NN =
+           nn_function(st_c(st_coid(.)), st_c(sanitationCode),3))
+
+
+# add risk features to a final fishnet
+finalNet <-
+  left_join(occurrenceNet, st_drop_geometry(varsNet), by="uniqueID") 
+
+finalNet <-
+  st_centroid(finalNet) %>%
+    st_join(dplyr::select(neighborhoods, name), by = "uniqueID") %>%
+    st_join(dplyr::select(policeDistricts, District), by = "uniqueID") %>%
+      st_drop_geometry() %>%
+      left_join(dplyr::select(finalNet, geometry, uniqueID)) %>%
+      st_sf() %>%
+  na.omit()
+
+
+# Visualize the NN features versus the non-NN versions.
+varsNet_long <- 
+    gather(varsNet, Variable, value, -geometry, -uniqueID)
+
+vars <- unique(varsNet_long$Variable)
+mapList <- list()
+
+for(i in vars){
+  mapList[[i]] <- 
+    ggplot() +
+    geom_sf(data = filter(varsNet_long, Variable == i), aes(fill=value), colour=NA) +
+    scale_fill_viridis(name="", option="inferno") +
+    guides(fill = guide_colourbar(barwidth = 0.5, barheight = 4)) +
+    labs(title=i) +
+    mapTheme(title_size = 8) +
+    theme(legend.margin=margin(-7,-7,-7,-7))
+  }
+
+do.call(grid.arrange,c(mapList, ncol=4, top="Risk Factors by Fishnet"))
+
+# Add distance to the Loop feature
+finalNet$loopDistance =
+  st_distance(st_centroid(finalNet),loopPoint) %>%
+  as.numeric()
+
+```
+
+
+To evaluate the effectiveness of the risk features chosen, each one is visualized as a function of domestic battery incidents.
+
+
+```{r fig.width=6, fig.height=6}
+
+correlation_long <-
+  st_drop_geometry(finalNet) %>%
+  dplyr::select(-uniqueID, -cvID, -loopDistance, -name, -District) %>%
+  gather(Variable, Value, -countOccurrences)
+
+
+correlation_cor <-
+  correlation_long %>%
+  group_by(Variable) %>%
+  summarize(correlation = cor(Value, countOccurrences, use = "complete.obs"))
+
+
+ggplot(correlation_long, aes(Value, countOccurrences)) +
+  geom_point(size = 0.1, colour="#ff3300") +
+  geom_text(data = correlation_cor, aes(label = paste("r =", round(correlation, 2))),
+            x=-Inf, y=Inf, vjust = 1.5, hjust = -.1) +
+  geom_smooth(method = "lm", se = FALSE, colour = "#96ecff") +
+  facet_wrap(~Variable, ncol = 2, scales = "free") +
+  labs(title = "Domestic battery incidents a function of risk factors") +
+  plotTheme() +
+  theme(panel.border = element_blank(),
+        panel.background = element_rect(fill = "#aaaaaa"),
+        panel.grid = element_blank(),
+        #panel.grid.major = element_blank(),
+        strip.text.x = element_text(size = 8)
+        )
+
+```
+
+Building violations are a much more powerful feature when used as a count feature rather than as the average distance to a violation. Liquor retail has no relation at all to battery incidents when used as a count variable, probably because liquor licenses cluster in wealthier and more commercial neighborhoods such as the Loop, but it shows an not insignificant correlation when engineered as the 'average distance to Liquor selling points'. Additionally, 311 rodent baiting requests are slightly improved when recoded as the exposure to these complaints, while sanitation code complaints correlation to domestic battery incident does not change much at all.
+
+
+***
+
+
+### Local Moran's I
+
+To gain more insight in how domestic battery incidents spatially cluster on an inter-neighborhood level, a **Local Moran’s I test* is performed, to prove that these incidents are not randomly distributed in space in regards of each neighborhood (or fishnet unit) with its adjacent localities.
+
+
+By identifying the places where the probability of incidences being random is minimal, it is then possible to define which are the “significant hotspots” of domestic battery in the city.
+
+
+```{r local Morans I}
+
+# create a queen neighbor weight matrix
+finalNet_nb <- poly2nb(as_Spatial(finalNet), queen=TRUE)
+finalNet_weights <- nb2listw(finalNet_nb, style="W", zero.policy=TRUE)
+
+# Calculate Local Moran's I
+localMorans <- localmoran(finalNet$countOccurrences, finalNet_weights, zero.policy=TRUE) %>% 
+  as.data.frame()
+
+# join local Moran's I results to fishnet
+finalNet_localMorans <- 
+  cbind(localMorans, as.data.frame(finalNet)) %>% 
+  st_sf() %>%
+  dplyr::select(occurrenceCount = countOccurrences, 
+                localMoransI = Ii, 
+                PValue = `Pr(z != E(Ii))`) %>%
+  mutate(significantHotspots = ifelse(PValue <= 0.001, 1, 0)) %>%
+  gather(Variable, Value, -geometry)
+
+finalNet <- finalNet %>% 
+  mutate(occurrence_isSig = 
+           ifelse(localMorans[,5] <= 0.001, 1, 0)) %>%
+  mutate(occurrence_isSig_dist = 
+           nn_function(st_c(st_coid(finalNet)),
+                       st_c(st_coid(filter(finalNet, 
+                                           occurrence_isSig == 1))), 
+                       k = 1))
+
+
+vars <- unique(finalNet_localMorans$Variable)  # Get variable names in dataframe
+varList <- list()                               # Create empty list
+
+# plot the statistics
+for(i in vars){
+  varList[[i]] <- 
+    ggplot() +
+      geom_sf(data = filter(finalNet_localMorans, Variable == i), 
+              aes(fill = Value), colour=NA) +
+      scale_fill_viridis(name="", option="inferno") +
+      labs(title=i) +
+      mapTheme(title_size = 12) +
+    theme(legend.position="bottom")}
+
+do.call(grid.arrange, c(varList, ncol = 4, top = "Local Morans I statistics, Domestic Battery"))
+
+```
+
+
+### Modeling and Cross-Validation
+
+
+Before running any regression model, it is important to review our dependent variable, domestic battery, to assess which type of regression would be more suitable for predicting its occurrence.
+
+
+```{r dependent variable model analysis}
+
+ggplot() +
+      geom_sf(data = finalNet, aes(fill=occurrence_isSig_dist), colour=NA) +
+      scale_fill_viridis(name="", option="inferno", direction = -1) +
+      labs(title="Exposure to Family Violence",
+           subtitle= "distance to incidents of domestic battery") +
+      mapTheme(title_size = 12)
+
+```
+
+Even though there are clear hotspots of domestic battery incidents, when the frequency of incidents by each fishnet cell is visualized, such as in the following histogram, it is clear that its occurrence is actually rare and thus an **OLS regression** is not appropriate for this model.
+
+```{r fig.width=4, fig.height=3}
+
+finalNet %>%
+  ggplot(aes(countOccurrences)) + 
+    geom_histogram(bins = 30, colour="#96ecff", fill = "#96ecff") +
+    geom_vline(xintercept = 0)  + 
+    labs(title="Domestic battery distribution", 
+         x="frequency by fishnet cell", y="count of domestic battery incidents") +
+    plotTheme() +
+  theme(panel.border = element_blank(),
+        panel.background = element_rect(fill = "#aaaaaa"),
+        #panel.grid = element_blank(),
+        panel.grid.major.x = element_blank(),
+        strip.text.x = element_text(size = 8)
+        )
+
+```
+
+Instead, a **Poisson regression** is used to better address a dependent variable based in counts of incidents. 
+
+For this, we use four different types of models that vary by the spatial units and the cross-validation method used and by whether they include **spatial features** that account for the presence and distance to hotspots, derived from the **Local Moran's I**.
+
+
+```{r regressions, results='hide'}
+
+# define the variables we want
+varsModel <- c("buildingViolations",
+               "liquorSell_NN",
+               "rodents_NN",
+               "loopDistance",
+               "sanitation_NN")
+
+# set the variables without spatial features
+reg_vars <- varsModel
+
+# set the variables with spatial features included
+reg_ss_vars <- c(varsModel,
+                 "occurrence_isSig",
+                 "occurrence_isSig_dist")
+
+
+# Run four regressions by model
+# regression with k-fold cv and no spatial features 
+reg_cv <- crossValidate(
+  dataset = finalNet,
+  id = "cvID",
+  dependentVariable = "countOccurrences",
+  indVariables = reg_vars) %>%
+    dplyr::select(cvID = cvID, countOccurrences, Prediction, geometry)
+
+# regression with k-fold cv and spatial features 
+reg_ss_cv <- crossValidate(
+  dataset = finalNet,
+  id = "cvID",
+  dependentVariable = "countOccurrences",
+  indVariables = reg_ss_vars) %>%
+    dplyr::select(cvID = cvID, countOccurrences, Prediction, geometry)
+
+# regression with LOGO-CV and no spatial features 
+reg_spatialCV <- crossValidate(
+  dataset = finalNet,
+  id = "name",
+  dependentVariable = "countOccurrences",
+  indVariables = reg_vars) %>%
+    dplyr::select(cvID = name, countOccurrences, Prediction, geometry)
+
+# regression with LOGO-CV and spatial features 
+reg_ss_spatialCV <- crossValidate(
+  dataset = finalNet,
+  id = "name",                           
+  dependentVariable = "countOccurrences",
+  indVariables = reg_ss_vars) %>%
+    dplyr::select(cvID = name, countOccurrences, Prediction, geometry)
+
+# join all four regressions in one dataset for comparison
+regSummary <- 
+  rbind(
+    mutate(reg_cv,           Error = Prediction - countOccurrences,
+                             Regression = "Random k-fold CV: Just Risk Factors"),
+    mutate(reg_ss_cv,        Error = Prediction - countOccurrences,
+                             Regression = "Random k-fold CV: Spatial Process"),
+    mutate(reg_spatialCV,    Error = Prediction - countOccurrences,
+                             Regression = "Spatial LOGO-CV: Just Risk Factors"),
+    mutate(reg_ss_spatialCV, Error = Prediction - countOccurrences,
+                             Regression = "Spatial LOGO-CV: Spatial Process")) %>%
+    st_sf() 
+
+
+# calculate errors by NEIGHBORHOOD
+error_by_reg_and_fold <- 
+  regSummary %>%
+  group_by(Regression, cvID) %>% 
+  summarize(MeanError = mean(Prediction - countOccurrences, na.rm = T),
+            MAE = mean(abs(MeanError), na.rm = T),
+            SD_MAE = mean(abs(MeanError), na.rm = T)) %>% 
+  ungroup()
+
+error_by_reg_and_fold %>% 
+  arrange(desc(MAE))
+error_by_reg_and_fold %>% 
+  arrange(MAE)
+
+```
+
+The errors in predicting domestic battery vary according to each model used in the regression. These can be compared in their frequency:
+
+```{r Model errors histogram}
+## plot histogram of OOF (out of fold) errors
+error_by_reg_and_fold %>%
+  ggplot(aes(MAE)) + 
+  geom_histogram(bins = 25, colour="#96ecff", fill = "#96ecff", binwidth = 0.5, center=0.25) +
+  facet_wrap(~Regression) +  
+  geom_vline(xintercept = 0) +
+    labs(title="Distribution of MAE", subtitle = "k-fold cross validation vs. LOGO-CV",
+         x="Mean Absolute Error", y="Count") +
+  xlim(c(0, 20))
+    plotTheme() +
+  theme(panel.border = element_blank(),
+        panel.background = element_rect(fill = "#aaaaaa"),
+        panel.grid = element_blank(),
+        panel.grid.major = element_blank(),
+        strip.text.x = element_text(size = 8)
+        )
+
+```
+
+Or in their spatial distribution, either by neighborhoods or by fishnet units:
+
+```{r LOGO-CV errors map}
+
+error_by_reg_and_fold %>%
+  filter(str_detect(Regression, "LOGO")) %>%
+  ggplot() +
+    geom_sf(aes(fill = MAE)) +
+    facet_wrap(~Regression) +
+    scale_fill_viridis(option="inferno", limits=c(0,20)) +
+    labs(title = "Domestic Battery errors by LOGO-CV Regression") +
+    mapTheme() +
+  theme(legend.position="bottom",
+        plot.title = element_text(size = 12),
+        strip.text.x = element_text(size = 8))
+```
+
+```{r k-fold CV errors map}
+
+error_by_reg_and_fold %>%
+  filter(str_detect(Regression, "k-fold")) %>%
+  ggplot() +
+    geom_sf(aes(fill = MAE)) +
+    facet_wrap(~Regression) +
+    scale_fill_viridis(option="inferno") +
+    labs(title = "Domestic Battery errors by LOGO-CV Regression") +
+    mapTheme() +
+  theme(legend.position="bottom",
+        plot.title = element_text(size = 12),
+        strip.text.x = element_text(size = 8))
+```
+
+Finally, the effectiveness of each model can be summarized and compared in a table:
+
+```{r results='asis'}
+
+st_drop_geometry(error_by_reg_and_fold) %>%
+  group_by(Regression) %>% 
+    summarize(MeanMAE = round(mean(MAE), 2),
+              SDMAE = round(sd(MAE), 2)) %>%
+  kable() %>%
+    kable_styling("striped", full_width = F) %>%
+    row_spec(2, color = "black", background = "#96ecffaa") %>%
+    row_spec(4, color = "black", background = "#96ecffaa") 
+
+```
+This way we can determine that the **Random k-fold CV model with Spatial process features** is the most effective model in reducing errors.
+
+
+
+As an additional step, the effectiveness of each of the four models is compared across race contexts, which in Chicago means comparing the errors between neighborhoods where the population is mostly white with those where the majority is non-white.
+
+```{r results='asis'}
+
+regSummary %>% 
+  st_centroid() %>%
+  st_join(tracts18) %>%
+  na.omit() %>%
+  st_drop_geometry() %>%
+  group_by(Regression, raceContext) %>%
+  summarize(meanError = mean(Error, na.rm = T)) %>%
+  spread(raceContext, meanError) %>%
+  kable(caption = "Mean Error by neighborhood racial context") %>%
+  kable_styling("striped", full_width = F) %>%
+  row_spec(2, color = "black", background = "#96ecffaa") %>%
+  row_spec(4, color = "black", background = "#96ecffaa")
+
+```
+
+Again, the **Random k-fold CV model with Spatial process features** performs better than the other models, in average underestimating the incidents in majority non-white neighborhoods by about one incident and overestimating it in majority white neighborhoods by one incident.
+
+
+***
+
+
+### Density vs predictions
+
+The final step in evaluating this model is comparing the risk predictions with the **kernel density** of points (using the `spatstat` function), which returns a simple estimate of 'hotspots' derived from the spatial autocorrelation of incidents within an specific radius.
+
+```{r kernel density}
+
+occurrences18 <- 
+  read.socrata("https://data.cityofchicago.org/Public-Safety/Crimes-2018/3i3m-jwuy") %>% 
+  filter(Primary.Type == crimeType & 
+         Description %in% unlist(apply(crimeSubtype, 1, list), recursive = FALSE)) %>% 
+  mutate(x = gsub("[()]", "", Location)) %>%
+  separate(x,into= c("Y","X"), sep=",") %>%
+  mutate(X = as.numeric(X),
+         Y = as.numeric(Y)) %>% 
+  na.omit %>%
+  st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
+  st_transform('ESRI:102271') %>% 
+  distinct() %>%
+  .[fishnet,]
+
+# create Kernel radii
+occurrppp <- as.ppp(st_coordinates(occurrences), W = st_bbox(finalNet))
+occurrKD_300m <- spatstat.core::density.ppp(occurrppp, 300*feetM)
+
+# create kernel density risk map based on 2018 occurrences
+occurrKDE_sf <- as.data.frame(occurrKD_300m) %>%
+  st_as_sf(coords = c("x", "y"), crs = st_crs(finalNet)) %>%
+  aggregate(., finalNet, mean) %>%
+  mutate(label = "Kernel Density",
+         Risk_Category = ntile(value, 100),
+         Risk_Category = case_when(                  # Remapping risk as five intervals
+           Risk_Category >= 90 ~ "90-100%",
+           Risk_Category >= 70 & Risk_Category <= 89 ~ "70-90%",
+           Risk_Category >= 50 & Risk_Category <= 69 ~ "50-70%",
+           Risk_Category >= 30 & Risk_Category <= 49 ~ "30-50%",
+           Risk_Category >= 1 & Risk_Category  <= 29 ~ "0-30%")) %>%
+  cbind(
+    aggregate(
+      dplyr::select(occurrences18) %>% mutate(occurrenceCount = 1), ., sum) %>%
+    mutate(occurrenceCount = replace_na(occurrenceCount, 0))) %>%
+  dplyr::select(label, Risk_Category, occurrenceCount)
+
+# create risk map from the Spatial LOGO-CV: Spatial Process model
+occurrrisk_ss_spatialcv <-
+  reg_ss_spatialCV %>%
+  mutate(label = "Risk Predictions",
+         Risk_Category = ntile(Prediction, 100),
+         Risk_Category = case_when(
+         Risk_Category >= 90 ~ "90-100%",
+         Risk_Category >= 70 & Risk_Category <= 89 ~ "70-90%",
+         Risk_Category >= 50 & Risk_Category <= 69 ~ "50-70%",
+         Risk_Category >= 30 & Risk_Category <= 49 ~ "30-50%",
+         Risk_Category >= 1 & Risk_Category <= 29 ~ "0-30%")) %>%
+  cbind(
+    aggregate(
+      dplyr::select(occurrences18) %>% mutate(occurrenceCount = 1), ., sum) %>%
+    mutate(occurrenceCount = replace_na(occurrenceCount, 0))) %>%
+  dplyr::select(label, Risk_Category, occurrenceCount)
+
+```
+
+For this comparison, both risk predictions, the kernel density and the k-fold spatial process regression based on 2017 data, are overlaid under the incidents of domestic battery in 2018.
+
+
+```{r kernel density vs risk predictions map}
+
+rbind(occurrKDE_sf, occurrrisk_ss_spatialcv) %>%
+  na.omit() %>%
+  gather(Variable, Value, -label, -Risk_Category, -geometry) %>%
+  ggplot() +
+    geom_sf(aes(fill = Risk_Category), colour = NA) +
+    geom_sf(data = sample_n(occurrences18, 3000), size = .5, colour = "#aaaaaa", alpha = .9) +
+    facet_wrap(~label, ) +
+    scale_fill_viridis(discrete = TRUE, option="inferno", name = "Risk category") +
+    labs(title="Comparison of Kernel Density and Risk Predictions",
+         subtitle="2018 domestic battery; 2017 domestic battery risk predictions") +
+    mapTheme(title_size = 14)  +
+  theme(strip.text.x = element_text(size=8))
+
+
+```
+
+Finally, the fitness of the model is evaluated by comparing the rate of domestic battery incidents in 2018, that could be predicted against the simple **kernel density** prediction, divided by different **risk categories** derived from each model.
+
+```{r bar chart comparing risk predictions}
+
+rbind(occurrKDE_sf, occurrrisk_ss_spatialcv) %>%
+  st_set_geometry(NULL) %>%
+  na.omit() %>%
+  gather(Variable, Value, -label, -Risk_Category) %>%
+  group_by(label, Risk_Category) %>%
+  summarize(countOccurrences = sum(Value)) %>%
+  ungroup() %>%
+  group_by(label) %>%
+  mutate(Rate_of_test_set_crimes = countOccurrences / sum(countOccurrences)) %>%
+    ggplot(aes(Risk_Category,Rate_of_test_set_crimes)) +
+      geom_bar(aes(fill=label), position="dodge", stat="identity") +
+      scale_fill_manual(name="", values = c("#96ecff", "#ff3300")) +
+      labs(title = "Risk prediction vs. Kernel density, 2018 domestic battery",
+           x="Risk category", y="Rate of domestic battery incidents") +
+      theme(axis.text.x = element_text(angle = 45, vjust = 0.5),
+            panel.grid.major.x = element_blank(),
+            panel.grid.minor.x = element_blank(),
+            panel.background = element_rect(colour = "#aaaaaa"))
+
+```
+
+The model selected, the **random k-fold cross-validation with spatial features** model seems to perform similarly to **kernel density** in the low-risk categories, underperform against it in the 50 to 70% and 70 to 90% categories, but outperform it in the highest 90 to 100% risk categories, which indicates a good overall ability to predict latent risk of domestic battery incidents.
+
+
+***
+
+
+### Conclusion
+
+This model seems like a good starting point for developing a family violence risk prediction tool that could be put into production, especially since it appears to perform relatively well across different racial contexts in a city as diverse and segregated as Chicago, but also because it performs better than a simple kernel density model. Probably, the model accuracy would benefit by adding continuous data features such as census demographic and income data that could fine-tune its predictive power.
+
+
+The positive aspect of a model that predicts domestic battery is that it can be translated into **preventive** measures alternative to the continuing over policing practices that are commonly put in place in the majority non-white neighborhoods of Chicago. For example, this tool could be translated into the allocation of social worker services, targeted information about services for reporting physical abuse, or community workshops that tackle family violence on a more approachable and preventive level.
+
